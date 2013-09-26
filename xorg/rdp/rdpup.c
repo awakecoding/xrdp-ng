@@ -23,17 +23,25 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include <xrdp-ng/xrdp.h>
 
-#define LOG_LEVEL 1
+#include <winpr/crt.h>
+#include <winpr/pipe.h>
+#include <winpr/synch.h>
+
+#define LOG_LEVEL 100
 #define LLOG(_level, _args) \
 		do { if (_level < LOG_LEVEL) { ErrorF _args ; } } while (0)
 #define LLOGLN(_level, _args) \
 		do { if (_level < LOG_LEVEL) { ErrorF _args ; ErrorF("\n"); } } while (0)
 
-static int g_listen_sck = 0;
-static int g_sck = 0;
-static int g_sck_closed = 0;
 static int g_connected = 0;
-static int g_dis_listen_sck = 0;
+
+#define PIPE_BUFFER_SIZE	0xFFFF
+
+int g_listenfd = -1;
+HANDLE g_ListenPipe = NULL;
+
+int g_clientfd = -1;
+HANDLE g_ClientPipe = NULL;
 
 static int g_begin = 0;
 static wStream* g_out_s = 0;
@@ -50,8 +58,7 @@ extern int g_Bpp;
 extern int g_Bpp_mask;
 extern rdpScreenInfoRec g_rdpScreen;
 extern int g_use_rail;
-extern int g_use_uds;
-extern char g_uds_data[];
+extern char g_PipeName[];
 extern int g_con_number;
 
 static int g_pixmap_byte_total = 0;
@@ -172,11 +179,15 @@ int convert_pixel(int in_pixel)
 
 static int rdpup_disconnect(void)
 {
-	RemoveEnabledDevice(g_sck);
-	g_connected = 0;
-	g_tcp_close(g_sck);
-	g_sck = 0;
-	g_sck_closed = 1;
+	if (g_clientfd != -1)
+	{
+		RemoveEnabledDevice(g_clientfd);
+		CloseHandle(g_ClientPipe);
+		g_ClientPipe = NULL;
+		g_clientfd = -1;
+		g_connected = 0;
+	}
+
 	g_pixmap_byte_total = 0;
 	g_pixmap_num_used = 0;
 	g_use_rail = 0;
@@ -184,45 +195,65 @@ static int rdpup_disconnect(void)
 	return 0;
 }
 
-/* returns error */
-static int rdpup_send(BYTE* data, int len)
+int rdpup_read(BYTE* data, int length)
 {
-	int sent;
+	BOOL fSuccess = FALSE;
+	DWORD NumberOfBytesRead;
+	DWORD TotalNumberOfBytesRead = 0;
 
-	LLOGLN(10, ("rdpup_send - sending %d bytes", len));
+	ErrorF("rdpup_read: %d ...\n", length);
 
-	if (g_sck_closed)
-		return 1;
-
-	while (len > 0)
+	while (length > 0)
 	{
-		sent = g_tcp_send(g_sck, data, len, 0);
+		NumberOfBytesRead = 0;
 
-		if (sent == -1)
-		{
-			if (g_tcp_last_error_would_block(g_sck))
-			{
-				g_sleep(1);
-			}
-			else
-			{
-				rdpup_disconnect();
-				return 1;
-			}
-		}
-		else if (sent == 0)
-		{
-			rdpup_disconnect();
-			return 1;
-		}
-		else
-		{
-			data += sent;
-			len -= sent;
-		}
+		fSuccess = ReadFile(g_ClientPipe, data, length, &NumberOfBytesRead, NULL);
+
+		ErrorF(" rdpup_read %d bytes\n", (int) NumberOfBytesRead);
+
+		if (!fSuccess)
+			return -1;
+
+		TotalNumberOfBytesRead += NumberOfBytesRead;
+		length -= NumberOfBytesRead;
+		data += NumberOfBytesRead;
 	}
 
-	return 0;
+	ErrorF(" rdpup_read %d bytes (done)\n", (int) TotalNumberOfBytesRead);
+
+	return (int) TotalNumberOfBytesRead;
+}
+
+int rdpup_write(BYTE* data, int length)
+{
+	BOOL fSuccess = FALSE;
+	DWORD NumberOfBytesWritten;
+	DWORD TotalNumberOfBytesWritten = 0;
+
+	ErrorF("rdpup_write: %d ...\n", length);
+
+	if (!g_ClientPipe)
+		return -1;
+
+	while (length > 0)
+	{
+		NumberOfBytesWritten = 0;
+
+		fSuccess = WriteFile(g_ClientPipe, data, length, &NumberOfBytesWritten, NULL);
+
+		ErrorF(" ...wrote %d bytes\n", (int) NumberOfBytesWritten);
+
+		if (!fSuccess)
+			return -1;
+
+		TotalNumberOfBytesWritten += NumberOfBytesWritten;
+		length -= NumberOfBytesWritten;
+		data += NumberOfBytesWritten;
+	}
+
+	ErrorF(" ...wrote %d bytes (done)\n", (int) NumberOfBytesWritten);
+
+	return (int) NumberOfBytesWritten;
 }
 
 static int rdpup_send_msg(wStream* s)
@@ -245,10 +276,10 @@ static int rdpup_send_msg(wStream* s)
 		Stream_Write_UINT32(s, length);
 		Stream_Write_UINT32(s, g_count);
 
-		status = rdpup_send(Stream_Buffer(s), length);
+		status = rdpup_write(Stream_Buffer(s), length);
 	}
 
-	if (status != 0)
+	if (status < 0)
 	{
 		rdpLog("error in rdpup_send_msg\n");
 	}
@@ -257,47 +288,6 @@ static int rdpup_send_msg(wStream* s)
 }
 
 int rdpup_update(XRDP_MSG_COMMON* msg);
-
-/* returns error */
-static int rdpup_recv(BYTE* data, int len)
-{
-	int rcvd;
-
-	if (g_sck_closed)
-	{
-		return 1;
-	}
-
-	while (len > 0)
-	{
-		rcvd = g_tcp_recv(g_sck, data, len, 0);
-
-		if (rcvd == -1)
-		{
-			if (g_tcp_last_error_would_block(g_sck))
-			{
-				g_sleep(1);
-			}
-			else
-			{
-				rdpup_disconnect();
-				return 1;
-			}
-		}
-		else if (rcvd == 0)
-		{
-			rdpup_disconnect();
-			return 1;
-		}
-		else
-		{
-			data += rcvd;
-			len -= rcvd;
-		}
-	}
-
-	return 0;
-}
 
 static int rdpup_recv_msg(wStream* s, int* type)
 {
@@ -309,23 +299,24 @@ static int rdpup_recv_msg(wStream* s, int* type)
 		Stream_EnsureCapacity(s, 10);
 		Stream_SetPosition(s, 0);
 
-		status = rdpup_recv(Stream_Pointer(s), 10);
+		status = rdpup_read(Stream_Pointer(s), 10);
 
-		if (status == 0)
+		if (status > 0)
 		{
 			xrdp_read_common_header(s, &common);
 
 			if (common.length >= 10)
 			{
 				Stream_EnsureCapacity(s, common.length);
-				status = rdpup_recv(Stream_Pointer(s), common.length - 10);
+				status = rdpup_read(Stream_Pointer(s), common.length - 10);
 			}
 		}
 	}
 
-	if (status != 0)
+	if (status < 0)
 	{
-		rdpLog("error in rdpup_recv_msg\n");
+		//rdpLog("error in rdpup_recv_msg\n");
+		return 1;
 	}
 
 	Stream_SetPosition(s, common.length);
@@ -334,7 +325,7 @@ static int rdpup_recv_msg(wStream* s, int* type)
 
 	*type = common.type;
 
-	return status;
+	return 0;
 }
 
 static int l_bound_by(int val, int low, int high)
@@ -745,21 +736,37 @@ UINT32 rdp_dstblt_rop(int opcode)
 	return rop;
 }
 
+int rdpup_create_listen_pipe()
+{
+	g_sprintf(g_PipeName, "\\\\.\\pipe\\FreeRDS_%s_X11rdp", display);
+
+	if (g_listenfd != -1)
+	{
+		RemoveEnabledDevice(g_listenfd);
+		g_listenfd = -1;
+	}
+
+	g_ListenPipe = CreateNamedPipe(g_PipeName, PIPE_ACCESS_DUPLEX,
+			PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+			PIPE_UNLIMITED_INSTANCES, PIPE_BUFFER_SIZE, PIPE_BUFFER_SIZE, 0, NULL);
+
+	if ((!g_ListenPipe) || (g_ListenPipe == INVALID_HANDLE_VALUE))
+	{
+		printf("CreateNamedPipe failure\n");
+		return -1;
+	}
+
+	g_listenfd = GetNamePipeFileDescriptor(g_ListenPipe);
+	AddEnabledDevice(g_listenfd);
+
+	LLOGLN(0, ("Created named pipe: %s (%d)", g_PipeName, g_listenfd));
+
+	return 1;
+}
+
 int rdpup_init(void)
 {
 	int i;
-	char text[256];
-
-	if (!g_directory_exist("/tmp/.pipe"))
-	{
-		if (!g_create_dir("/tmp/.pipe"))
-		{
-			LLOGLN(0, ("rdpup_init: g_create_dir failed"));
-			return 0;
-		}
-
-		g_chmod_hex("/tmp/.pipe", 0x1777);
-	}
 
 	i = atoi(display);
 
@@ -782,101 +789,110 @@ int rdpup_init(void)
 
 	pfbBackBufferMemory = (BYTE*) malloc(g_rdpScreen.sizeInBytes);
 
-	g_sprintf(g_uds_data, "/tmp/.pipe/FreeRDS_%s_X11rdp", display);
-
-	LLOGLN(0, ("rdpup_init: %s", g_uds_data));
-
-	if (g_listen_sck == 0)
-	{
-		g_listen_sck = g_tcp_local_socket_stream();
-
-		if (g_tcp_local_bind(g_listen_sck, g_uds_data) != 0)
-		{
-			LLOGLN(0, ("rdpup_init: g_tcp_local_bind failed"));
-			return 0;
-		}
-
-		g_tcp_listen(g_listen_sck);
-		AddEnabledDevice(g_listen_sck);
-	}
-
-	g_dis_listen_sck = g_tcp_local_socket_dgram();
-
-	if (g_dis_listen_sck != 0)
-	{
-		g_sprintf(text, "/tmp/.pipe/xrdp_disconnect_display_%s", display);
-
-		if (g_tcp_local_bind(g_dis_listen_sck, text) == 0)
-		{
-			AddEnabledDevice(g_dis_listen_sck);
-		}
-		else
-		{
-			rdpLog("g_tcp_local_bind failed [%s]\n", text);
-		}
-	}
+	rdpup_create_listen_pipe();
 
 	return 1;
 }
 
+static int g_fakefd = -1;
+static HANDLE g_FakeEvent = NULL;
+
 int rdpup_check(void)
 {
-	int sel;
-	int new_sck;
-	char buf[8];
+	DWORD nCount;
+	DWORD status;
+	HANDLE events[8];
 
-	sel = g_tcp_select3(g_listen_sck, g_sck, g_dis_listen_sck);
+	nCount = 0;
 
-	if (sel & 1)
+	if (g_ListenPipe)
+		events[nCount++] = g_ListenPipe;
+
+	if (g_ClientPipe)
+		events[nCount++] = g_ClientPipe;
+
+	if (!g_FakeEvent)
 	{
-		new_sck = g_tcp_accept(g_listen_sck);
+		g_FakeEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+		g_fakefd = GetEventFileDescriptor(g_FakeEvent);
+		SetEvent(g_FakeEvent);
 
-		if (new_sck == -1)
+		AddEnabledDevice(g_fakefd);
+	}
+
+	//events[nCount++] = g_FakeEvent;
+
+	ErrorF("WaitForMultipleObjects: g_clientfd: %d g_listenfd: %d\n",
+			g_clientfd, g_listenfd);
+
+	status = WaitForMultipleObjects(nCount, events, FALSE, INFINITE);
+
+	ErrorF("WaitForMultipleObjects(nCount = %d): 0x%04X g_connected: %d g_begin: %d\n",
+			(int) nCount, (int) status, g_connected, g_begin);
+
+	if (g_ListenPipe)
+	{
+		if (WaitForSingleObject(g_ListenPipe, 0) == WAIT_OBJECT_0)
 		{
-		}
-		else
-		{
-			if (g_sck != 0)
+			BOOL fConnected;
+			DWORD dwPipeMode;
+
+			fConnected = ConnectNamedPipe(g_ListenPipe, NULL);
+
+			if (!fConnected)
+				fConnected = (GetLastError() == ERROR_PIPE_CONNECTED);
+
+			LLOGLN(0, ("ConnectNamedPipe status: %d\n", fConnected));
+
+			if (!fConnected)
 			{
-				/* should maybe ask is user wants to allow here with timeout */
-				rdpLog("replacing connection, already got a connection\n");
-				rdpup_disconnect();
+				LLOGLN(0, ("ConnectNamedPipe failure: %d\n", (int) GetLastError()));
+				return 1;
 			}
 
-			rdpLog("got a connection\n");
-			g_sck = new_sck;
-			g_tcp_set_non_blocking(g_sck);
-			g_tcp_set_no_delay(g_sck);
-			g_connected = 1;
-			g_sck_closed = 0;
+			if (g_clientfd != -1)
+			{
+				RemoveEnabledDevice(g_clientfd);
+				g_clientfd = -1;
+			}
+
+			g_ClientPipe = g_ListenPipe;
+
+			dwPipeMode = PIPE_NOWAIT;
+			SetNamedPipeHandleState(g_ClientPipe, &dwPipeMode, NULL, NULL);
+
+			g_clientfd = GetNamePipeFileDescriptor(g_ClientPipe);
+
+			g_tcp_set_no_delay(g_clientfd);
+
+			RemoveEnabledDevice(g_listenfd);
+			g_listenfd = -1;
+			g_ListenPipe = NULL;
+
 			g_begin = 0;
 			g_con_number++;
+			g_connected = 1;
 			g_rdpScreen.fbAttached = 0;
-			AddEnabledDevice(g_sck);
+			AddEnabledDevice(g_clientfd);
+
+			//rdpup_create_listen_pipe();
 		}
 	}
 
-	if (sel & 2)
+	if (g_ClientPipe)
 	{
-		int type = 0;
-
-		if (rdpup_recv_msg(g_in_s, &type) == 0)
+		if (WaitForSingleObject(g_ClientPipe, 0) == WAIT_OBJECT_0)
 		{
-			rdpup_process_msg(g_in_s, type);
-		}
-	}
+			int type = 0;
 
-	if (sel & 4)
-	{
-		if (g_tcp_recv(g_dis_listen_sck, buf, 4, 0) > 0)
-		{
-			if (g_sck != 0)
+			if (rdpup_recv_msg(g_in_s, &type) == 0)
 			{
-				rdpLog("disconnecting session via user request\n");
-				rdpup_disconnect();
+				rdpup_process_msg(g_in_s, type);
 			}
 		}
 	}
+
+	ErrorF("Done checking stuff\n");
 
 	return 0;
 }
@@ -894,8 +910,6 @@ int rdpup_begin_update(void)
 
 		Stream_SetPosition(g_out_s, 0);
 		Stream_Seek(g_out_s, 8);
-
-		LLOGLN(10, ("begin %d", g_count));
 
 		msg.type = XRDP_SERVER_BEGIN_UPDATE;
 		rdpup_update((XRDP_MSG_COMMON*) &msg);
@@ -975,7 +989,7 @@ int rdpup_update(XRDP_MSG_COMMON* msg)
 	}
 	else
 	{
-		//LLOGLN(0, ("rdpup_update: discarding %s message (%d)", xrdp_server_message_name(msg->type), msg->type));
+		LLOGLN(0, ("rdpup_update: discarding %s message (%d)", xrdp_server_message_name(msg->type), msg->type));
 	}
 
 	return 0;

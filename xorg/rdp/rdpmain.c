@@ -54,6 +54,9 @@ DeviceIntPtr g_keyboard = 0;
 Bool g_wrapWindow = 1;
 Bool g_wrapPixmap = 1;
 
+extern HANDLE g_ClientPipe;
+extern HANDLE g_ListenPipe;
+
 rdpPixmapRec g_screenPriv;
 
 /* if true, running in RemoteApp / RAIL mode */
@@ -63,9 +66,7 @@ int g_con_number = 0; /* increments for each connection */
 
 WindowPtr g_invalidate_window = 0;
 
-/* if true, use a unix domain socket instead of a tcp socket */
-char g_uds_data[256] = ""; /* data */
-char g_uds_cont[256] = ""; /* control */
+char g_PipeName[256] = ""; /* data */
 
 /* set all these at once, use function set_bpp */
 int g_bpp = 16;
@@ -710,8 +711,6 @@ void InitInput(int argc, char **argv)
 
 void ddxGiveUp(enum ExitCode error)
 {
-	char unixSocketName[128];
-
 	ErrorF("ddxGiveUp:\n");
 
 	if (g_rdpScreen.sharedMemory)
@@ -731,15 +730,7 @@ void ddxGiveUp(enum ExitCode error)
 
 	if (g_initOutputCalled)
 	{
-		sprintf(unixSocketName, "/tmp/.X11-unix/X%s", display);
-		unlink(unixSocketName);
-		sprintf(unixSocketName, "/tmp/.pipe/xrdp_disconnect_display_%s", display);
-		unlink(unixSocketName);
-
-		if (g_uds_data[0] != 0)
-		{
-			unlink(g_uds_data);
-		}
+		CloseHandle(g_ListenPipe);
 	}
 }
 

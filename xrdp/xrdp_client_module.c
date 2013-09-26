@@ -38,6 +38,7 @@
 
 #include <winpr/crt.h>
 #include <winpr/pipe.h>
+#include <winpr/path.h>
 #include <winpr/synch.h>
 #include <winpr/thread.h>
 #include <winpr/stream.h>
@@ -49,38 +50,62 @@
 int xrdp_client_read(xrdpModule* mod, BYTE* data, int length)
 {
 	BOOL fSuccess = FALSE;
-	DWORD lpNumberOfBytesRead = 0;
+	DWORD NumberOfBytesRead;
+	DWORD TotalNumberOfBytesRead = 0;
 
-	fSuccess = ReadFile(mod->hClientPipe, data, length, &lpNumberOfBytesRead, NULL);
+	printf("xrdp_client_read...\n");
 
-	if (!fSuccess || (lpNumberOfBytesRead == 0))
+	while (length > 0)
 	{
-		return -1;
+		NumberOfBytesRead = 0;
+
+		fSuccess = ReadFile(mod->hClientPipe, data, length, &NumberOfBytesRead, NULL);
+
+		printf("...xrdp_client_read: %d\n", (int) NumberOfBytesRead);
+
+		if (!fSuccess)
+			return -1;
+
+		TotalNumberOfBytesRead += NumberOfBytesRead;
+		length -= NumberOfBytesRead;
+		data += NumberOfBytesRead;
 	}
 
-	return lpNumberOfBytesRead;
+	printf("...xrdp_client_read: %d (done)\n", (int) TotalNumberOfBytesRead);
+
+	return TotalNumberOfBytesRead;
 }
 
 int xrdp_client_write(xrdpModule* mod, BYTE* data, int length)
 {
 	BOOL fSuccess = FALSE;
-	DWORD lpNumberOfBytesWritten = 0;
+	DWORD NumberOfBytesWritten;
+	DWORD TotalNumberOfBytesWritten = 0;
+
+	printf("xrdp_client_write...\n");
 
 	if (!mod->hClientPipe)
 		return -1;
 
 	while (length > 0)
 	{
-		fSuccess = WriteFile(mod->hClientPipe, data, length, &lpNumberOfBytesWritten, NULL);
+		NumberOfBytesWritten = 0;
 
-		if (!fSuccess || (lpNumberOfBytesWritten == 0))
+		fSuccess = WriteFile(mod->hClientPipe, data, length, &NumberOfBytesWritten, NULL);
+
+		printf("...xrdp_client_write: %d\n", (int) NumberOfBytesWritten);
+
+		if (!fSuccess)
 			return -1;
 
-		length -= lpNumberOfBytesWritten;
-		data += lpNumberOfBytesWritten;
+		TotalNumberOfBytesWritten += NumberOfBytesWritten;
+		length -= NumberOfBytesWritten;
+		data += NumberOfBytesWritten;
 	}
 
-	return 0;
+	printf("...xrdp_client_write: %d (done!)\n", (int) TotalNumberOfBytesWritten);
+
+	return TotalNumberOfBytesWritten;
 }
 
 int xrdp_client_capabilities(xrdpModule* mod)
@@ -115,7 +140,9 @@ int xrdp_client_start(xrdpModule* mod)
 {
 	BOOL status;
 	HANDLE token;
+	char* filename;
 	char envstr[256];
+	DWORD dwPipeMode;
 	char pipeName[256];
 	struct passwd* pwnam;
 	rdpSettings* settings;
@@ -124,6 +151,15 @@ int xrdp_client_start(xrdpModule* mod)
 	PROCESS_INFORMATION ProcessInformation;
 
 	settings = mod->settings;
+
+	sprintf_s(pipeName, sizeof(pipeName), "\\\\.\\pipe\\FreeRDS_%d_%s", (int) mod->SessionId, "X11rdp");
+
+	filename = GetNamedPipeUnixDomainSocketFilePathA(pipeName);
+
+	if (PathFileExistsA(filename))
+		DeleteFileA(filename);
+
+	free(filename);
 
 	token = NULL;
 
@@ -155,8 +191,6 @@ int xrdp_client_start(xrdpModule* mod)
 
 	printf("Process started: %d\n", status);
 
-	sprintf_s(pipeName, sizeof(pipeName), "\\\\.\\pipe\\FreeRDS_%d_%s", (int) mod->SessionId, "X11rdp");
-
 	if (!WaitNamedPipeA(pipeName, 5 * 1000))
 	{
 		printf("WaitNamedPipe failure: %s\n", pipeName);
@@ -171,6 +205,9 @@ int xrdp_client_start(xrdpModule* mod)
 		printf("Failed to create named pipe %s\n", pipeName);
 		return 1;
 	}
+
+	dwPipeMode = PIPE_NOWAIT;
+	SetNamedPipeHandleState(mod->hClientPipe, &dwPipeMode, NULL, NULL);
 
 	ZeroMemory(&StartupInfo, sizeof(STARTUPINFO));
 	StartupInfo.cb = sizeof(STARTUPINFO);
@@ -585,6 +622,8 @@ int xrdp_client_receive(xrdpModule* mod)
 	int position;
 
 	s = mod->ReceiveStream;
+
+	printf("xrdp_client_receive\n");
 
 	if (Stream_GetPosition(s) < 8)
 	{
