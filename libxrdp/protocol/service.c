@@ -52,6 +52,7 @@ void* freerds_service_listener_thread(void* arg)
 		if (service->Accept)
 		{
 			service->Accept(service);
+			break;
 		}
 	}
 
@@ -99,6 +100,15 @@ rdsService* freerds_service_new(DWORD SessionId, const char* endpoint)
 
 		service->client = freerds_server_inbound_interface_new();
 		service->server = freerds_server_outbound_interface_new();
+
+		service->OutboundStream = Stream_New(NULL, 8192);
+		service->InboundStream = Stream_New(NULL, 8192);
+
+		service->InboundTotalLength = 0;
+		service->InboundTotalCount = 0;
+
+		service->OutboundTotalLength = 0;
+		service->OutboundTotalCount = 0;
 	}
 
 	return service;

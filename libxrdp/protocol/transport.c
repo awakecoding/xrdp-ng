@@ -36,6 +36,9 @@ int freerds_named_pipe_read(HANDLE hNamedPipe, BYTE* data, DWORD length)
 	DWORD NumberOfBytesRead;
 	DWORD TotalNumberOfBytesRead = 0;
 
+	if (!hNamedPipe)
+		return -1;
+
 	NumberOfBytesRead = 0;
 
 	fSuccess = ReadFile(hNamedPipe, data, length, &NumberOfBytesRead, NULL);
@@ -57,6 +60,9 @@ int freerds_named_pipe_write(HANDLE hNamedPipe, BYTE* data, DWORD length)
 	BOOL fSuccess = FALSE;
 	DWORD NumberOfBytesWritten;
 	DWORD TotalNumberOfBytesWritten = 0;
+
+	if (!hNamedPipe)
+		return -1;
 
 	while (length > 0)
 	{
@@ -133,6 +139,8 @@ HANDLE freerds_named_pipe_create(DWORD SessionId, const char* endpoint)
 	hNamedPipe = CreateNamedPipe(pipeName, PIPE_ACCESS_DUPLEX,
 			PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
 			PIPE_UNLIMITED_INSTANCES, PIPE_BUFFER_SIZE, PIPE_BUFFER_SIZE, 0, NULL);
+
+	fprintf(stderr, "Creating Named Pipe: %s\n", pipeName);
 
 	if ((!hNamedPipe) || (hNamedPipe == INVALID_HANDLE_VALUE))
 	{
